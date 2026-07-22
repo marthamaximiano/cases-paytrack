@@ -1,7 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useSession } from "@tanstack/react-start/server";
 import { createClient } from "@supabase/supabase-js";
-import type { Database } from "@/integrations/supabase/types";
 
 type GateSession = { unlocked?: boolean };
 type Msg = { role: "user" | "assistant"; content: string };
@@ -16,17 +15,11 @@ function sessionConfig() {
 }
 
 function makeClient() {
-  const key = process.env.SUPABASE_PUBLISHABLE_KEY!;
-  return createClient<Database>(process.env.SUPABASE_URL!, key, {
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const key = process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+  if (!url || !key) return null;
+  return createClient(url, key, {
     auth: { storage: undefined, persistSession: false, autoRefreshToken: false },
-    global: {
-      fetch: (input, init) => {
-        const h = new Headers(init?.headers);
-        if (key.startsWith("sb_") && h.get("Authorization") === `Bearer ${key}`) h.delete("Authorization");
-        h.set("apikey", key);
-        return fetch(input, { ...init, headers: h });
-      },
-    },
   });
 }
 
@@ -52,18 +45,18 @@ function tokenize(s: string): string[] {
   return normalize(s).split(/\s+/).filter((w) => w.length >= 3 && !STOP.has(w));
 }
 
-function summarize(content: string, maxChars = 350): string {
-  const clean = content.replace(/\s+/g, " ").trim();
+function summarize(content: string, maxChars = 400): string {
+  const clean = (content || "").replace(/\s+/g, " ").trim();
   if (clean.length <= maxChars) return clean;
   return clean.slice(0, maxChars) + " …";
 }
 
 type CaseRow = {
   title: string;
-  sector: string;
-  highlight: string;
-  content: string;
-  logo: string | null;
+  sector?: string;
+  highlight?: string;
+  content?: string;
+  logo?: string | null;
 };
 
 function scoreCase(c: CaseRow, tokens: string[]): number {
@@ -105,167 +98,140 @@ export const Route = createFileRoute("/api/chat")({
   server: {
     handlers: {
       POST: async ({ request }) => {
-        const session = await useSession<GateSession>(sessionConfig());
-        if (!session.data.unlocked) {
-          return new Response("locked", { status: 401 });
-        }
-
-        const apiKey = process.env.ANTHROPIC_API_KEY;
-        if (!apiKey) return new Response("ANTHROPIC_API_KEY missing", { status: 500 });
-
-        const body = (await request.json()) as { messages?: Msg[] };
-        const messages = Array.isArray(body.messages) ? body.messages : [];
-        if (messages.length === 0) return new Response("empty", { status: 400 });
-
-        let cases: CaseRow[] = [];
         try {
-          const supabase = makeClient();
-          const { data: rows, error } = await supabase
-            .from("cases")
-            .select("title, sector, highlight, content, logo");
-
-          if (error) {
-            console.error("Erro ao buscar no Supabase:", error);
+          const session = await useSession<GateSession>(sessionConfig());
+          if (!session.data?.unlocked) {
+            return new Response("locked", { status: 401 });
           }
-          cases = rows ?? [];
-        } catch (err) {
-          console.error("Falha de conexao Supabase:", err);
-        }
 
-        const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
-        const convoText = messages.map((m) => m.content).join(" ");
-        const userTokens = tokenize(lastUser);
-        
-        if (userTokens.includes("km") || convoText.toLowerCase().includes("km")) {
-          userTokens.push("trajetos", "trajeto");
-        }
-        if (userTokens.includes("trajetos") || userTokens.includes("trajeto")) {
-          userTokens.push("km");
-        }
+          const apiKey = process.env.ANTHROPIC_API_KEY;
+          if (!apiKey) return new Response("ANTHROPIC_API_KEY missing", { status: 500 });
 
-        const convoTokens = tokenize(convoText);
-        const relevant = pickRelevant(cases, userTokens, convoTokens, 3);
+          const body = (await request.json()) as { messages?: Msg[] };
+          const messages = Array.isArray(body.messages) ? body.messages : [];
+          if (messages.length === 0) return new Response("empty", { status: 400 });
 
-        const docsText = relevant.length > 0
-          ? relevant
-              .map(
-                (d, i) =>
-                  `--- CASE ${String(i + 1).padStart(2, "0")}: ${d.title}${d.sector ? " (" + d.sector + ")" : ""}${d.highlight ? " [" + d.highlight + "]" : ""} [LOGO: ${d.logo ? "disponível" : "não disponível"}] ---\n${summarize(d.content ?? "")}`,
-              )
-              .join("\n\n")
-          : "Nenhum case encontrado na tabela do Supabase.";
+          let cases: CaseRow[] = [];
+          const supabase = makeClient();
+          if (supabase) {
+            try {
+              const { data: rows, error } = await supabase
+                .from("cases")
+                .select("title, sector, highlight, content, logo");
 
-        const system = `Você é o assistente interno de cases da Paytrack, empresa de gestão de despesas, viagens e cartões corporativos. Responda perguntas de funcionários usando APENAS o conteúdo dos cases abaixo extraídos do banco de dados Supabase. Se a resposta não estiver nos cases, diga claramente que não encontrou essa informação nos documentos disponíveis — não invente números nem clientes. Sempre cite o nome do cliente/case de onde veio a informação.
+              if (!error && rows) {
+                cases = rows as CaseRow[];
+              }
+            } catch (err) {
+              console.error("Erro Supabase:", err);
+            }
+          }
 
-Cada case indica entre colchetes se tem LOGO disponível. Ao citar uma empresa, o sistema exibe o logo automaticamente abaixo da resposta — NÃO insira markdown de imagem, URLs ou tags <img>. Apenas cite o nome da empresa.
+          const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+          const convoText = messages.map((m) => m.content).join(" ");
+          const userTokens = tokenize(lastUser);
 
-FORMATAÇÃO (obrigatório):
-- Markdown limpo: **negrito** para destaques, ## para títulos curtos quando útil, listas com "- ".
-- NUNCA use linhas divisórias ("---", "***", "___").
-- Não use blocos de código para texto normal.
-- Ao apresentar vários cases, use lista onde cada item começa com **nome da empresa** e os números/insights.
+          if (userTokens.includes("km") || convoText.toLowerCase().includes("km")) {
+            userTokens.push("trajetos", "trajeto");
+          }
+          if (userTokens.includes("trajetos") || userTokens.includes("trajeto")) {
+            userTokens.push("km");
+          }
 
-Trate "Gestão de km" e "Trajetos" como o mesmo recurso.
+          const convoTokens = tokenize(convoText);
+          const relevant = pickRelevant(cases, userTokens, convoTokens, 3);
 
-CASES RELEVANTES DO SUPABASE (${relevant.length} de ${cases.length}):
+          const docsText = relevant.length > 0
+            ? relevant
+                .map(
+                  (d, i) =>
+                    `--- CASE ${String(i + 1).padStart(2, "0")}: ${d.title}${d.sector ? " (" + d.sector + ")" : ""}${d.highlight ? " [" + d.highlight + "]" : ""} ---\n${summarize(d.content ?? "")}`,
+                )
+                .join("\n\n")
+            : "Nenhum case encontrado no banco de dados.";
+
+          const system = `Você é o assistente interno de cases da Paytrack. Responda à pergunta do usuário utilizando prioritariamente as informações dos cases fornecidos abaixo extraídos do Supabase. Se não encontrar nos cases fornecidos, responda com base no seu conhecimento de forma educada e objetiva.
+
+FORMATAÇÃO:
+- Respostas curtas e diretas ao ponto.
+- Use **negrito** para destacar nomes de empresas e métricas.
+- Destaque o setor e os principais resultados obtidos.
+
+CASES DISPONÍVEIS DO SUPABASE (${relevant.length} selecionados):
 
 ${docsText}`;
 
-        const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-api-key": apiKey,
-            "anthropic-version": "2023-06-01",
-          },
-          body: JSON.stringify({
-            model: "claude-3-haiku-20240307",
-            max_tokens: 1024,
-            stream: true,
-            system,
-            messages,
-          }),
-        });
-
-        if (!anthropicRes.ok || !anthropicRes.body) {
-          const errText = await anthropicRes.text().catch(() => "");
-          console.error("Anthropic error details:", errText);
-          return new Response(`Anthropic error ${anthropicRes.status}: ${errText.slice(0, 300)}`, {
-            status: 502,
+          const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-api-key": apiKey,
+              "anthropic-version": "2023-06-01",
+            },
+            body: JSON.stringify({
+              model: "claude-3-haiku-20240307",
+              max_tokens: 1024,
+              stream: true,
+              system,
+              messages,
+            }),
           });
-        }
 
-        const encoder = new TextEncoder();
-        const decoder = new TextDecoder();
-        let assistantBuf = "";
+          if (!anthropicRes.ok || !anthropicRes.body) {
+            const errText = await anthropicRes.text().catch(() => "");
+            return new Response(`Erro API Claude (${anthropicRes.status}): ${errText.slice(0, 200)}`, { status: 502 });
+          }
 
-        const stream = new ReadableStream<Uint8Array>({
-          async start(controller) {
-            const reader = anthropicRes.body!.getReader();
-            let sseBuf = "";
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                sseBuf += decoder.decode(value, { stream: true });
-                const parts = sseBuf.split("\n\n");
-                sseBuf = parts.pop() ?? "";
-                for (const part of parts) {
-                  const line = part.split("\n").find((l) => l.startsWith("data:"));
-                  if (!line) continue;
-                  const payload = line.slice(5).trim();
-                  if (!payload || payload === "[DONE]") continue;
-                  try {
-                    const ev = JSON.parse(payload) as {
-                      type?: string;
-                      delta?: { type?: string; text?: string };
-                    };
-                    if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta" && ev.delta.text) {
-                      assistantBuf += ev.delta.text;
-                      controller.enqueue(encoder.encode(ev.delta.text));
+          const encoder = new TextEncoder();
+          const decoder = new TextDecoder();
+
+          const stream = new ReadableStream<Uint8Array>({
+            async start(controller) {
+              const reader = anthropicRes.body!.getReader();
+              let sseBuf = "";
+              try {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  sseBuf += decoder.decode(value, { stream: true });
+                  const parts = sseBuf.split("\n\n");
+                  sseBuf = parts.pop() ?? "";
+                  for (const part of parts) {
+                    const line = part.split("\n").find((l) => l.startsWith("data:"));
+                    if (!line) continue;
+                    const payload = line.slice(5).trim();
+                    if (!payload || payload === "[DONE]") continue;
+                    try {
+                      const ev = JSON.parse(payload) as {
+                        type?: string;
+                        delta?: { type?: string; text?: string };
+                      };
+                      if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta" && ev.delta.text) {
+                        controller.enqueue(encoder.encode(ev.delta.text));
+                      }
+                    } catch {
+                      // ignore parse errors
                     }
-                  } catch {
-                    // ignore malformed SSE
                   }
                 }
+              } catch (err) {
+                console.error("Stream error:", err);
+              } finally {
+                controller.close();
               }
+            },
+          });
 
-              const hay = new Set(normalize(lastUser + " " + assistantBuf).split(/\s+/).filter(Boolean));
-              const LOGO_STOP = new Set([
-                "grupo","de","da","do","das","dos","e","a","o","case","ltda","sa","consorcio",
-                "construtor","centro","estudos","pesquisas","sistema","sistemas","brasil","the",
-              ]);
-              const seen = new Set<string>();
-              const logos: Array<{ title: string; logo: string }> = [];
-              for (const d of cases) {
-                if (!d.logo || seen.has(d.title)) continue;
-                const tw = normalize(d.title).split(/\s+/).filter((w) => w.length >= 3 && !LOGO_STOP.has(w));
-                if (!tw.length) continue;
-                if (tw.some((w) => hay.has(w))) {
-                  logos.push({ title: d.title, logo: d.logo });
-                  seen.add(d.title);
-                }
-              }
-
-              controller.enqueue(
-                encoder.encode("\n<<<PT_LOGOS>>>" + JSON.stringify({ logos })),
-              );
-            } catch (err) {
-              controller.enqueue(encoder.encode("\n[erro de streaming]"));
-              console.error("stream error", err);
-            } finally {
-              controller.close();
-            }
-          },
-        });
-
-        return new Response(stream, {
-          headers: {
-            "content-type": "text/plain; charset=utf-8",
-            "cache-control": "no-cache, no-transform",
-            "x-accel-buffering": "no",
-          },
-        });
+          return new Response(stream, {
+            headers: {
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "no-cache",
+            },
+          });
+        } catch (globalErr) {
+          console.error("Global route error:", globalErr);
+          return new Response("Erro interno no servidor.", { status: 500 });
+        }
       },
     },
   },
