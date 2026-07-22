@@ -52,7 +52,7 @@ function tokenize(s: string): string[] {
   return normalize(s).split(/\s+/).filter((w) => w.length >= 3 && !STOP.has(w));
 }
 
-function summarize(content: string, maxChars =300): string {
+function summarize(content: string, maxChars = 350): string {
   const clean = content.replace(/\s+/g, " ").trim();
   if (clean.length <= maxChars) return clean;
   return clean.slice(0, maxChars) + " …";
@@ -89,7 +89,7 @@ function scoreCase(c: CaseRow, tokens: string[]): number {
   return score;
 }
 
-function pickRelevant(cases: CaseRow[], userTokens: string[], convoTokens: string[], limit = 6): CaseRow[] {
+function pickRelevant(cases: CaseRow[], userTokens: string[], convoTokens: string[], limit = 3): CaseRow[] {
   if (!cases || cases.length === 0) return [];
   const scored = cases.map((c) => ({
     c,
@@ -117,7 +117,6 @@ export const Route = createFileRoute("/api/chat")({
         const messages = Array.isArray(body.messages) ? body.messages : [];
         if (messages.length === 0) return new Response("empty", { status: 400 });
 
-        // 1. CONSULTA DIRETA AO SUPABASE
         let cases: CaseRow[] = [];
         try {
           const supabase = makeClient();
@@ -145,9 +144,7 @@ export const Route = createFileRoute("/api/chat")({
         }
 
         const convoTokens = tokenize(convoText);
-        
-        // 2. FILTRA OS CASES MAIS RELEVANTES DO BANCO
-        const relevant = pickRelevant(cases, userTokens, convoTokens, 6);
+        const relevant = pickRelevant(cases, userTokens, convoTokens, 3);
 
         const docsText = relevant.length > 0
           ? relevant
@@ -174,7 +171,6 @@ CASES RELEVANTES DO SUPABASE (${relevant.length} de ${cases.length}):
 
 ${docsText}`;
 
-        // 3. ENVIA O CONTEXTO FILTRADO DO BANCO PARA O CLAUDE
         const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: {
