@@ -76,14 +76,14 @@ export const Route = createFileRoute("/api/chat")({
             cases = (rows as CaseRow[]) ?? [];
           }
 
-          // Ranqueia os cases mais alinhados à pesquisa
+          // Ranqueamento dos cases
           const scored = cases.map((c) => ({ c, score: scoreCase(c, tokens) }));
           scored.sort((a, b) => b.score - a.score);
           
           const relevant = scored.filter((s) => s.score > 0).slice(0, 3).map((s) => s.c);
           const finalCases = relevant.length > 0 ? relevant : cases.slice(0, 3);
 
-          // Monta a resposta direto no Backend sem passar por NENHUMA IA externa
+          // Construção do texto de resposta
           let responseText = "";
           if (finalCases.length > 0) {
             responseText = `Aqui estão os cases mais relevantes que encontrei no banco de dados:\n\n`;
@@ -97,26 +97,20 @@ export const Route = createFileRoute("/api/chat")({
             responseText = "Não encontrei nenhum case correspondente aos termos pesquisados.";
           }
 
+          // Envio formatado para o leitor de stream do frontend
           const encoder = new TextEncoder();
-          const stream = new ReadableStream<Uint8Array>({
-            start(controller) {
-              controller.enqueue(encoder.encode(responseText));
-              
-              // Inclui os logos das empresas encontradas
-              const logos = finalCases
-                .filter((c) => c.logo)
-                .map((c) => ({ title: c.title, logo: c.logo! }));
+          const logos = finalCases
+            .filter((c) => c.logo)
+            .map((c) => ({ title: c.title, logo: c.logo! }));
 
-              if (logos.length > 0) {
-                controller.enqueue(encoder.encode("\n<<<PT_LOGOS>>>" + JSON.stringify({ logos })));
-              }
+          const fullPayload = responseText + (logos.length > 0 ? "\n<<<PT_LOGOS>>>" + JSON.stringify({ logos }) : "");
 
-              controller.close();
+          return new Response(fullPayload, {
+            status: 200,
+            headers: { 
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "no-cache"
             },
-          });
-
-          return new Response(stream, {
-            headers: { "content-type": "text/plain; charset=utf-8" },
           });
         } catch (err) {
           return new Response("Erro ao buscar cases.", { status: 500 });
