@@ -52,7 +52,7 @@ function tokenize(s: string): string[] {
   return normalize(s).split(/\s+/).filter((w) => w.length >= 3 && !STOP.has(w));
 }
 
-function summarize(content: string, maxChars = 1400): string {
+function summarize(content: string, maxChars =300): string {
   const clean = content.replace(/\s+/g, " ").trim();
   if (clean.length <= maxChars) return clean;
   return clean.slice(0, maxChars) + " …";
